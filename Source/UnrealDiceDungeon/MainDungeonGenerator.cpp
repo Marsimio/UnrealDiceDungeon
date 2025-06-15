@@ -7,6 +7,7 @@
 #include "TimerManager.h"
 #include "Engine/EngineTypes.h"
 #include "DrawDebugHelpers.h"
+#include "NavigationSystem.h"
 #include "Engine/OverlapResult.h"
 
 AMainDungeonGenerator::AMainDungeonGenerator()
@@ -22,17 +23,15 @@ void AMainDungeonGenerator::BeginPlay()
 
 void AMainDungeonGenerator::GenerateDungeon()
 {
-    // Ensure required blueprints are set
     if (!FirstRoomBlueprint || CorridorBlueprints.Num() == 0)
     {
         UE_LOG(LogTemp, Warning, TEXT("No first room or corridor blueprints set."));
         return;
     }
 
-    // Generate the random seed if it is not set (RandomSeed == 0)
     if (RandomSeed == 0)
     {
-        RandomSeed = FMath::Rand(); // Generate a random seed
+        RandomSeed = FMath::Rand();
         UE_LOG(LogTemp, Warning, TEXT("RandomSeed not provided; using generated seed: %d"), RandomSeed);
     }
     else
@@ -40,37 +39,56 @@ void AMainDungeonGenerator::GenerateDungeon()
         UE_LOG(LogTemp, Warning, TEXT("Using provided RandomSeed: %d"), RandomSeed);
     }
 
-    // Initialize the RNG with the seed
     DungeonRNG.Initialize(RandomSeed);
 
     FVector Location = GetActorLocation();
     FRotator Rotation = FRotator::ZeroRotator;
 
-    // Spawn the first room
     AActor* FirstRoom = GetWorld()->SpawnActor<AActor>(FirstRoomBlueprint, Location, Rotation);
     if (!FirstRoom) return;
 
     SpawnedRooms.Add(FirstRoom);
     RoomsSpawned = 1;
 
-    // Start generating the dungeon
     while (RoomsSpawned < NumRoomsToGenerate)
     {
-        GenerateNextRoom();
+        if (!GenerateNextRoom())
+        {
+            UE_LOG(LogTemp, Error, TEXT("Generation stopped early due to failure."));
+            break;
+        }
     }
 
     UE_LOG(LogTemp, Warning, TEXT("Dungeon generation complete. Total rooms: %d"), RoomsSpawned);
+
+    UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld());
+    if (NavSys)
+    {
+        NavSys->Build();
+        UE_LOG(LogTemp, Warning, TEXT("Navigation mesh rebuilt."));
+    }
+
+    for (AActor* Room : SpawnedRooms)
+    {
+        if (!Room) continue;
+
+        UFunction* SpawnFunction = Room->FindFunction(FName("SpawnEnemies"));
+        if (SpawnFunction)
+        {
+            Room->ProcessEvent(SpawnFunction, nullptr);
+            UE_LOG(LogTemp, Warning, TEXT("SpawnEnemies called on: %s"), *Room->GetName());
+        }
+    }
 }
 
-void AMainDungeonGenerator::GenerateNextRoom()
+bool AMainDungeonGenerator::GenerateNextRoom()
 {
     if (RoomsSpawned >= NumRoomsToGenerate)
     {
         UE_LOG(LogTemp, Warning, TEXT("Dungeon generation complete."));
-        return;
+        return false;
     }
 
-    // Collect all available exits
     TArray<UArrowComponent*> AllAvailableExits;
     for (AActor* Room : SpawnedRooms)
     {
@@ -87,21 +105,17 @@ void AMainDungeonGenerator::GenerateNextRoom()
     if (AllAvailableExits.Num() == 0)
     {
         UE_LOG(LogTemp, Warning, TEXT("No more available exits."));
-        return;
+        return false;
     }
 
     while (AllAvailableExits.Num() > 0)
     {
-        // Randomly select an exit
         int32 Index = DungeonRNG.RandRange(0, AllAvailableExits.Num() - 1);
         UArrowComponent* ExitArrow = AllAvailableExits[Index];
         AllAvailableExits.RemoveAt(Index);
 
-        // Randomly select a corridor blueprint
         int32 CorridorIndex = DungeonRNG.RandRange(0, CorridorBlueprints.Num() - 1);
         TSubclassOf<AActor> CorridorClass = CorridorBlueprints[CorridorIndex];
-
-        UE_LOG(LogTemp, Warning, TEXT("Attempting to spawn corridor: %s"), *GetNameSafe(CorridorClass.Get()));
 
         AActor* Corridor = GetWorld()->SpawnActor<AActor>(CorridorClass);
         if (!Corridor) continue;
@@ -119,12 +133,24 @@ void AMainDungeonGenerator::GenerateNextRoom()
 
         AlignActorToArrow(ExitArrow, CorridorStart, Corridor);
 
-        // Determine whether to spawn a shop on the rooms' last iteration
-        bool bPlaceShop = (RoomsSpawned == NumRoomsToGenerate - 1 && ShopBlueprint); 
-        TSubclassOf<AActor> RoomClass = bPlaceShop ? ShopBlueprint : RoomBlueprints[DungeonRNG.RandRange(0, RoomBlueprints.Num() - 1)];
+        bool bPlaceEndRoom = (RoomsSpawned == NumRoomsToGenerate - 1 && EndRoomBlueprint);
+        bool bPlaceShop = (RoomsSpawned == NumRoomsToGenerate - 2 && ShopBlueprint);
 
-        UE_LOG(LogTemp, Warning, TEXT("Attempting to spawn %s at available exit."),
-            *GetNameSafe(RoomClass.Get()));
+        TSubclassOf<AActor> RoomClass;
+        if (bPlaceEndRoom)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Placing end room."));
+            RoomClass = EndRoomBlueprint;
+        }
+        else if (bPlaceShop)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Placing shop room."));
+            RoomClass = ShopBlueprint;
+        }
+        else
+        {
+            RoomClass = RoomBlueprints[DungeonRNG.RandRange(0, RoomBlueprints.Num() - 1)];
+        }
 
         AActor* NextRoom = GetWorld()->SpawnActor<AActor>(RoomClass);
         if (!NextRoom)
@@ -141,7 +167,7 @@ void AMainDungeonGenerator::GenerateNextRoom()
             continue;
         }
 
-        UArrowComponent* EntranceArrow = Entrances[0];
+        UArrowComponent* EntranceArrow = Entrances[DungeonRNG.RandRange(0, Entrances.Num() - 1)];
         AlignActorToArrow(CorridorEnd, EntranceArrow, NextRoom);
 
         if (CheckOverlap(Corridor) || CheckOverlap(NextRoom))
@@ -156,21 +182,16 @@ void AMainDungeonGenerator::GenerateNextRoom()
         SpawnedRooms.Add(NextRoom);
         RoomsSpawned++;
 
-        if (bPlaceShop)
-        {
-            UE_LOG(LogTemp, Warning, TEXT("Shop room successfully placed on exit: %s"), *ExitArrow->GetName());
-        }
+        DestroyArrowWithChildren(ExitArrow);
+        DestroyArrowWithChildren(CorridorStart);
+        DestroyArrowWithChildren(CorridorEnd);
+        DestroyArrowWithChildren(EntranceArrow);
 
-        if (ExitArrow && ExitArrow->IsValidLowLevel())
-        {
-            UE_LOG(LogTemp, Log, TEXT("Destroying used arrow: %s"), *ExitArrow->GetName());
-            ExitArrow->DestroyComponent();
-        }
-
-        return;
+        return true;
     }
 
     UE_LOG(LogTemp, Warning, TEXT("Room %d failed to place."), RoomsSpawned);
+    return false;
 }
 
 void AMainDungeonGenerator::AlignActorToArrow(UArrowComponent* TargetArrow, UArrowComponent* SourceArrow, AActor* ActorToMove)
@@ -259,4 +280,22 @@ bool AMainDungeonGenerator::CheckOverlap(AActor* Actor)
     }
 
     return false;
+}
+
+void AMainDungeonGenerator::DestroyArrowWithChildren(USceneComponent* Arrow)
+{
+    if (!Arrow || !Arrow->IsValidLowLevel()) return;
+
+    TArray<USceneComponent*> ChildComponents;
+    Arrow->GetChildrenComponents(true, ChildComponents);
+
+    for (USceneComponent* Child : ChildComponents)
+    {
+        if (Child && Child->IsValidLowLevel())
+        {
+            Child->DestroyComponent();
+        }
+    }
+
+    Arrow->DestroyComponent();
 }
